@@ -1,14 +1,11 @@
 from fastapi import FastAPI, File, UploadFile
 import pdfplumber
 import spacy
-import ast  # Add at the top
 import uvicorn
 import requests
 import json
-import openai
+from google import genai
 import speech_recognition as sr
-from pydantic import BaseModel
-from google.generativeai import configure, GenerativeModel
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
@@ -39,7 +36,16 @@ SKILLS = {
 # Google Gemini API Details
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 GEMINI_API_KEY = "AIzaSyBMV5Q88ds0XmMGP2nPSvyFUCWSTbzpeF0"  # Replace with your actual API key
-
+conversation_history=["Instructions:"+
+"Ask him question one at a time and also cross qusetion just like an interview"
++"Return plain text and avoid asking question which is difficult to read out"+
+"If user query is out of context of the interview, remind him to remain in interview ans ask previous question again"+
+"Total 5 questions only then end the interview"+
+"The Question should not be very long so that the candidate may not get overwhelmed"+
+"Ask for a brief introduction, to get the name of the user and then use it later on if required"
+"Act as an interver and from now on return response accordingly as interview has started"
+"the candidate has skill in "
+]
 
 def extract_text_from_pdf(file):
     """Extract text from a PDF file."""
@@ -61,52 +67,30 @@ def extract_skills(text):
         if token.text in SKILLS:
             extracted_skills.add(token.text)
 
-    return list(extracted_skills)
+    return " ".join(extracted_skills)
 
 
 import json
 import re
-
-def generate_questions(skills):
-    """Send skills to Gemini API and get 5 interview questions."""
-    prompt = f"""Generate 5 technical interview questions  (just descibe , difference etc) for a candidate with the following skills: {', '.join(skills)}.
-            The questions should be of 1 or 2 line max and must be formatted as follows in json format, nothing extra just json:
-            ```json
-            {{
-                "questions": [
-                    "Question 1",
-                    "Question 2",
-                    "Question 3",
-                    "Question 4",
-                    "Question 5"
-                ]
-            }}
-            ```"""
-
-    headers = {"Content-Type": "application/json"}
-    data = {"contents": [{"parts": [{"text": prompt}]}]}
-
-    try:
-        response = requests.post(f"{GEMINI_API_URL}?key={GEMINI_API_KEY}", json=data, headers=headers)
-        response_data = response.json()
-
-        # Extract text from Gemini response
-        if "candidates" in response_data:
-            raw_text = response_data["candidates"][0]["content"]["parts"][0]["text"]
-
-            # **Remove triple backticks and extract only the JSON part**
-            json_match = re.search(r'```json\n(.*?)\n```', raw_text, re.DOTALL)
-            if json_match:
-                json_text = json_match.group(1)  # Extract the JSON content
-
-                # Convert string to a proper JSON object
-                questions_json = json.loads(json_text)
-                return questions_json  # Return parsed JSON
-
-        return {"error": "No valid JSON found in response", "raw_response": raw_text}
-
-    except Exception as e:
-        return {"error": str(e)}
+# def interview(mssg):
+#     client = genai.Client(api_key=GEMINI_API_KEY)
+    
+#     if mssg:  # Only add to conversation if there's a user message
+#         conversation_history.append("User_response:" + mssg)
+    
+#     response = client.models.generate_content(
+#         model="gemini-2.0-flash",
+#         contents=conversation_history
+#     )
+    
+#     interviewer_response = response.text
+#     conversation_history.append("gemini_response:" + interviewer_response) 
+    
+#     # Return both the user's transcribed message and the interviewer's response
+#     return {
+#         "Response": interviewer_response,
+#         "User_response": mssg if mssg else ""
+#     }
 
 
 @app.post("/upload")
@@ -120,55 +104,113 @@ async def upload_resume(file: UploadFile = File(...)):
         if not skills:
             return {"error": "No relevant skills found in the resume."}
 
-        questions = generate_questions(skills)
-
-        return questions
+        conversation_history[0]=conversation_history[0]+skills
     except Exception as e:
         return {"error": str(e)}
-@app.post("/evaluate")
+    return interview("")
+    
+# Modified transcribe endpoint to handle WAV files better
+
+import wave
+import os
+import tempfile
+import uuid
+
+@app.post("/transcribe")
 async def evaluate_audio(file: UploadFile = File(...)):
-    # Save audio file
-    filename = "temp_audio.wav"
-    with open(filename, "wb") as f:
-        f.write(file.file.read())
-
-    # Convert speech to text
-    recognizer = sr.Recognizer()
-    with sr.AudioFile(filename) as source:
-        audio = recognizer.record(source)
-
+    # Create unique temporary filename
+    temp_dir = tempfile.gettempdir()
+    unique_id = uuid.uuid4()
+    temp_in_path = os.path.join(temp_dir, f"input_{unique_id}.webm")
+    temp_out_path = os.path.join(temp_dir, f"output_{unique_id}.wav")
+    
     try:
-        response_text = recognizer.recognize_google(audio)
-    except sr.UnknownValueError:
-        return {"score": 0, "error": "Speech not recognized"}
-    except sr.RequestError:
-        return {"score": 0, "error": "Speech-to-text service unavailable"}
+        # Save the uploaded file
+        content = await file.read()
+        with open(temp_in_path, "wb") as f:
+            f.write(content)
+        
+        print(f"Received audio file: {file.filename}, size: {len(content)} bytes")
+        
+        # Use speech recognition
+        recognizer = sr.Recognizer()
+        
+        try:
+            with sr.AudioFile(temp_in_path) as source:
+                # Adjust for ambient noise
+                recognizer.adjust_for_ambient_noise(source)
+                # Record audio with longer timeout and phrase threshold
+                audio = recognizer.record(source)
+            
+            # Try to recognize speech with increased timeout
+            response_text = recognizer.recognize_google(
+                audio, 
+                language="en-US", 
+                show_all=False
+            )
+            print(f"Transcribed text: {response_text}")
+            
+            result = interview(response_text)
+            
+            result["transcribed_text"] = response_text
+            
+            return result
+            
+        except sr.UnknownValueError as e:
+            print(f"Speech recognition error: {str(e)}")
+            return {"error": "Speech not recognized. Please speak clearly and try again."}
+        except sr.RequestError as e:
+            print(f"Speech recognition service error: {str(e)}")
+            return {"error": "Speech-to-text service unavailable"}
+        except Exception as e:
+            print(f"Error processing audio file: {str(e)}")
+            return {"error": f"Error processing audio: {str(e)}"}
+    finally:
+        # Clean up the temporary files
+        for path in [temp_in_path, temp_out_path]:
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"Removed temporary file: {path}")
 
-    # Evaluate using Gemini API
-    prompt = f"Evaluate this interview response and rate it out of 10: {response_text}"
-
-    headers = {"Content-Type": "application/json"}
-    data = {"contents": [{"parts": [{"text": prompt}]}]}
-
+# Modified interview function to better format responses
+def interview(mssg):
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    
+    if mssg:  
+        conversation_history.append("User_response:" + mssg)
+    
     try:
-        response = requests.post(f"{GEMINI_API_URL}?key={GEMINI_API_KEY}", json=data, headers=headers)
-        response_data = response.json()
-
-        # Extract text from Gemini response
-        if "candidates" in response_data:
-            raw_text = response_data["candidates"][0]["content"]["parts"][0]["text"]
-
-            # Extract only the numeric score from response
-            match = re.search(r'\b(\d{1,2})\b', raw_text)  # Looks for a number (1-2 digits)
-            score = int(match.group(1)) if match else 0  # Default to 0 if no number found
-
-            return {"score": score}
-
-        return {"score": 0, "error": "Invalid response from API", "raw_response": raw_text}
-
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=conversation_history
+        )
+        
+        interviewer_response = response.text
+        conversation_history.append("gemini_response:" + interviewer_response) 
+        
+        return {
+            "Response": interviewer_response,
+            "User_response": mssg if mssg else ""
+        }
     except Exception as e:
-        return {"score": 0, "error": str(e)}
+        print(f"Error generating response: {str(e)}")
+        return {
+            "Response": "I apologize, but I'm having trouble processing your response. Let's continue with the interview. Could you please respond to my previous question?",
+            "User_response": mssg if mssg else "",
+            "error": str(e)
+        }
+# @app.get("/calculate_score")
+# def score():
+#     client=genai.Client(api_key=GEMINI_API_KEY)
+#     content = [
+#         "Here is the conversational history. Each question carries 10 marks. Evaluate and just return the final score of the user in text:"
+#     ] + conversation_history
+#     response=client.models.generate_content(
+#         model="gemini-2.0-flash",
+#         content=content
+#     )
+#     return {"Score":response.text}
 
-
+   
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
